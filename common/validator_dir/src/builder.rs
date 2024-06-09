@@ -1,5 +1,5 @@
 use crate::{Error as DirError, ValidatorDir};
-use bls::get_withdrawal_credentials;
+use bls::{get_withdrawal_credentials};
 use deposit_contract::{encode_eth1_tx_data, Error as DepositError};
 use directory::ensure_dir_exists;
 use eth2_keystore::{Error as KeystoreError, Keystore, KeystoreBuilder, PlainText};
@@ -8,7 +8,7 @@ use rand::{distributions::Alphanumeric, Rng};
 use std::fs::{create_dir_all, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use types::{ChainSpec, DepositData, Hash256, Keypair, Signature};
+use types::{Address, ChainSpec, DepositData, Hash256, Keypair, Signature};
 
 /// The `Alphanumeric` crate only generates a-z, A-Z, 0-9, therefore it has a range of 62
 /// characters.
@@ -57,6 +57,7 @@ pub struct Builder<'a> {
     password_dir: Option<PathBuf>,
     pub(crate) voting_keystore: Option<(Keystore, PlainText)>,
     pub(crate) withdrawal_keystore: Option<(Keystore, PlainText)>,
+    pub(crate) withdrawal_address: Option<Address>,
     store_withdrawal_keystore: bool,
     deposit_info: Option<(u64, &'a ChainSpec)>,
 }
@@ -69,6 +70,7 @@ impl<'a> Builder<'a> {
             password_dir: None,
             voting_keystore: None,
             withdrawal_keystore: None,
+            withdrawal_address: None,
             store_withdrawal_keystore: true,
             deposit_info: None,
         }
@@ -166,13 +168,17 @@ impl<'a> Builder<'a> {
             ensure_dir_exists(password_dir).map_err(Error::UnableToCreatePasswordDir)?;
         }
 
-        // The withdrawal keystore must be initialized in order to store it or create an eth1
-        // deposit.
-        if (self.store_withdrawal_keystore || self.deposit_info.is_some())
-            && self.withdrawal_keystore.is_none()
-        {
+        // The withdrawal keystore must be initialized in order to store it.
+        if self.store_withdrawal_keystore && self.withdrawal_keystore.is_none() {
             return Err(Error::UninitializedWithdrawalKeystore);
         };
+        // Either the withdrawal keystore or withdrawal address must be initialized to create
+        // an eth1 deposit.
+        if self.deposit_info.is_some() && self.withdrawal_keystore.is_none() && self.withdrawal_address.is_none() {
+            return Err(Error::UninitializedWithdrawalKeystore);
+        }
+
+        let mut option_deposit_data: Option<DepositData> = None;
 
         if let Some((withdrawal_keystore, withdrawal_password)) = self.withdrawal_keystore {
             // Attempt to decrypt the voting keypair.
@@ -182,7 +188,8 @@ impl<'a> Builder<'a> {
             let withdrawal_keypair =
                 withdrawal_keystore.decrypt_keypair(withdrawal_password.as_bytes())?;
 
-            // If a deposit amount was specified, create a deposit.
+            // If a deposit amount was specified, create deposit data with BLS withdrawal
+            // credentials.
             if let Some((amount, spec)) = self.deposit_info {
                 let withdrawal_credentials = Hash256::from_slice(&get_withdrawal_credentials(
                     &withdrawal_keypair.pk,
@@ -197,47 +204,7 @@ impl<'a> Builder<'a> {
                 };
 
                 deposit_data.signature = deposit_data.create_signature(&voting_keypair.sk, spec);
-
-                let deposit_data =
-                    encode_eth1_tx_data(&deposit_data).map_err(Error::UnableToEncodeDeposit)?;
-
-                // Save `ETH1_DEPOSIT_DATA_FILE` to file.
-                //
-                // This allows us to know the RLP data for the eth1 transaction without needing to know
-                // the withdrawal/voting keypairs again at a later date.
-                let path = dir.join(ETH1_DEPOSIT_DATA_FILE);
-                if path.exists() {
-                    return Err(Error::DepositDataAlreadyExists(path));
-                } else {
-                    let hex = format!("0x{}", hex::encode(deposit_data));
-                    File::options()
-                        .write(true)
-                        .read(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(path)
-                        .map_err(Error::UnableToSaveDepositData)?
-                        .write_all(hex.as_bytes())
-                        .map_err(Error::UnableToSaveDepositData)?
-                }
-
-                // Save `ETH1_DEPOSIT_AMOUNT_FILE` to file.
-                //
-                // This allows us to know the intended deposit amount at a later date.
-                let path = dir.join(ETH1_DEPOSIT_AMOUNT_FILE);
-                if path.exists() {
-                    return Err(Error::DepositAmountAlreadyExists(path));
-                } else {
-                    File::options()
-                        .write(true)
-                        .read(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(path)
-                        .map_err(Error::UnableToSaveDepositAmount)?
-                        .write_all(format!("{}", amount).as_bytes())
-                        .map_err(Error::UnableToSaveDepositAmount)?
-                }
+                option_deposit_data = Some(deposit_data);
             }
 
             if self.password_dir.is_none() && self.store_withdrawal_keystore {
@@ -259,6 +226,74 @@ impl<'a> Builder<'a> {
                         &withdrawal_keystore,
                     )?;
                 }
+            }
+        }
+
+        if let Some(withdrawal_address) = self.withdrawal_address {
+            // If a deposit amount was specified, create deposit data with BLS withdrawal
+            // credentials.
+            if let Some((amount, spec)) = self.deposit_info {
+                // Attempt to decrypt the voting keypair.
+                let voting_keypair = voting_keystore.decrypt_keypair(voting_password.as_bytes())?;
+                let withdrawal_credentials = Hash256::from_slice(&get_withdrawal_credentials_address(
+                    &withdrawal_address,
+                    spec.eth1_address_withdrawal_prefix_byte,
+                ));
+
+                let mut deposit_data = DepositData {
+                    pubkey: voting_keypair.pk.clone().into(),
+                    withdrawal_credentials,
+                    amount,
+                    signature: Signature::empty().into(),
+                };
+
+                deposit_data.signature = deposit_data.create_signature(&voting_keypair.sk, spec);
+                option_deposit_data = Some(deposit_data);
+            }
+        }
+
+        // If deposit data was created, write it to disk.
+        if let Some(deposit_data) = option_deposit_data {
+            let amount = deposit_data.amount;
+            let encoded_deposit_data =
+                encode_eth1_tx_data(&deposit_data).map_err(Error::UnableToEncodeDeposit)?;
+
+            // Save `ETH1_DEPOSIT_DATA_FILE` to file.
+            //
+            // This allows us to know the RLP data for the eth1 transaction without needing to know
+            // the withdrawal/voting keypairs again at a later date.
+            let path = dir.join(ETH1_DEPOSIT_DATA_FILE);
+            if path.exists() {
+                return Err(Error::DepositDataAlreadyExists(path));
+            } else {
+                let hex = format!("0x{}", hex::encode(encoded_deposit_data));
+                File::options()
+                    .write(true)
+                    .read(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .map_err(Error::UnableToSaveDepositData)?
+                    .write_all(hex.as_bytes())
+                    .map_err(Error::UnableToSaveDepositData)?
+            }
+
+            // Save `ETH1_DEPOSIT_AMOUNT_FILE` to file.
+            //
+            // This allows us to know the intended deposit amount at a later date.
+            let path = dir.join(ETH1_DEPOSIT_AMOUNT_FILE);
+            if path.exists() {
+                return Err(Error::DepositAmountAlreadyExists(path));
+            } else {
+                File::options()
+                    .write(true)
+                    .read(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .map_err(Error::UnableToSaveDepositAmount)?
+                    .write_all(format!("{}", amount).as_bytes())
+                    .map_err(Error::UnableToSaveDepositAmount)?
             }
         }
 
@@ -326,4 +361,15 @@ fn random_keystore() -> Result<(Keystore, PlainText), Error> {
     let keystore = KeystoreBuilder::new(&keypair, password.as_bytes(), "".into())?.build()?;
 
     Ok((keystore, password))
+}
+
+/// Returns the withdrawal credentials for an Eth1 address.
+///
+/// Used for submitting deposits to the Eth1 deposit contract.
+pub fn get_withdrawal_credentials_address(withdrawal_address: &Address, prefix_byte: u8) -> Vec<u8> {
+    let mut withdrawal_credentials = [0; 32];
+    withdrawal_credentials[0] = prefix_byte;
+    withdrawal_credentials[12..].copy_from_slice(withdrawal_address.as_bytes());
+
+    withdrawal_credentials.to_vec()
 }
