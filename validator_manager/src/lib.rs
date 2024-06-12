@@ -8,6 +8,7 @@ use types::EthSpec;
 
 pub mod common;
 pub mod create_validators;
+pub mod exit_validators;
 pub mod import_validators;
 pub mod move_validators;
 
@@ -54,6 +55,7 @@ pub fn cli_app() -> Command {
                 .help_heading(FLAG_HEADER),
         )
         .subcommand(create_validators::cli_app())
+        .subcommand(exit_validators::cli_app())
         .subcommand(import_validators::cli_app())
         .subcommand(move_validators::cli_app())
 }
@@ -76,6 +78,9 @@ pub fn run<E: EthSpec>(matches: &ArgMatches, env: Environment<E>) -> Result<(), 
                 match matches.subcommand() {
                     Some((create_validators::CMD, matches)) => {
                         create_validators::cli_run::<E>(matches, &spec, dump_config).await
+                    }
+                    Some((exit_validators::CMD, matches)) => {
+                        exit_validators::cli_run(matches, dump_config).await
                     }
                     Some((import_validators::CMD, matches)) => {
                         import_validators::cli_run(matches, dump_config).await
